@@ -160,8 +160,13 @@ class PackageEventReceiver() :
                             repo.updateAppVersion(
                                 packageName = packageName,
                                 newTag = installedTag,
-                                newAssetName = app.latestAssetName ?: "",
-                                newAssetUrl = app.latestAssetUrl ?: "",
+                                // Confirming an install we started: carry the identity saved with
+                                // it, not the snapshot, which may have moved on since.
+                                newReleaseId = app.pendingInstallReleaseId ?: app.installedReleaseId,
+                                newAssetId = app.pendingInstallAssetId ?: app.installedAssetId,
+                                newAssetDigest = app.pendingInstallAssetDigest ?: app.installedAssetDigest,
+                                newAssetName = app.latestAssetName,
+                                newAssetUrl = app.latestAssetUrl,
                                 newVersionName = systemInfo.versionName,
                                 newVersionCode = systemInfo.versionCode,
                                 signingFingerprint = app.signingFingerprint,
@@ -262,13 +267,16 @@ class PackageEventReceiver() :
                 VersionVerdict.UNKNOWN -> app.isUpdateAvailable
             }
 
-        repo.updateInstalledVersion(
-            packageName = packageName,
-            installedVersion = app.tagForObservedBuild(systemInfo.versionName, systemInfo.versionCode),
-            installedVersionName = systemInfo.versionName,
-            installedVersionCode = systemInfo.versionCode,
-            isUpdateAvailable = newIsUpdateAvailable,
-        )
+        repo.executeInTransaction {
+            repo.updateInstalledVersion(
+                packageName = packageName,
+                installedVersion = app.tagForObservedBuild(systemInfo.versionName, systemInfo.versionCode),
+                installedVersionName = systemInfo.versionName,
+                installedVersionCode = systemInfo.versionCode,
+                isUpdateAvailable = newIsUpdateAvailable,
+            )
+            repo.clearInstallBinding(packageName)
+        }
 
         Logger.i {
             "External version change via broadcast: $packageName " +

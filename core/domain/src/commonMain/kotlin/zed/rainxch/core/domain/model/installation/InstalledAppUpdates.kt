@@ -6,8 +6,12 @@ import zed.rainxch.core.domain.utils.resolveExternalInstallVerdict
 
 fun InstalledApp.confirmInstall(
     tag: String,
-    assetName: String,
-    assetUrl: String,
+    releaseId: Long? = null,
+    assetId: Long? = null,
+    assetDigest: String? = null,
+    // Unknown must be null, never "": "" never equals a real asset name.
+    assetName: String?,
+    assetUrl: String?,
     versionName: String,
     versionCode: Long,
     signingFingerprint: String?,
@@ -39,6 +43,10 @@ fun InstalledApp.confirmInstall(
         installedAssetUrl = assetUrl,
         installedVersionName = versionName,
         installedVersionCode = versionCode,
+        // From the install parameters, never from the latest* snapshot columns.
+        installedReleaseId = releaseId ?: installedReleaseId,
+        installedAssetId = assetId ?: installedAssetId,
+        installedAssetDigest = assetDigest ?: installedAssetDigest,
         isUpdateAvailable =
             when {
                 latestIsSkipped -> false
@@ -55,6 +63,9 @@ fun InstalledApp.confirmInstall(
         pendingInstallFilePath = parkedFile,
         pendingInstallVersion = parkedVersion,
         pendingInstallAssetName = parkedAsset,
+        pendingInstallReleaseId = if (isPending) pendingInstallReleaseId else null,
+        pendingInstallAssetId = if (isPending) pendingInstallAssetId else null,
+        pendingInstallAssetDigest = if (isPending) pendingInstallAssetDigest else null,
     )
 }
 
@@ -65,6 +76,8 @@ fun InstalledApp.resolvePendingFromSystem(
 ): InstalledApp {
     val targetCode = latestVersionCode ?: 0L
     val installReachedTarget = targetCode > 0L && versionCode >= targetCode
+    // An unknown target cannot be disproved, so the identity stands in that case.
+    val identityLands = targetCode <= 0L || installReachedTarget
     val adoptedTag =
         if (installReachedTarget) {
             pendingInstallVersion ?: resolvedTag
@@ -76,6 +89,16 @@ fun InstalledApp.resolvePendingFromSystem(
         installedVersion = adoptedTag,
         installedVersionName = versionName,
         installedVersionCode = versionCode,
+        // The identity recorded when the install started lands on the installed side only when the
+        // system proved the install reached that build; otherwise the record stops claiming a
+        // release it no longer matches and is rebound on the next install. A pending state that
+        // never carried a target identity (a parked file) keeps whatever installed* already said.
+        installedReleaseId = (pendingInstallReleaseId ?: installedReleaseId).takeIf { identityLands },
+        installedAssetId = (pendingInstallAssetId ?: installedAssetId).takeIf { identityLands },
+        installedAssetDigest = (pendingInstallAssetDigest ?: installedAssetDigest).takeIf { identityLands },
+        pendingInstallReleaseId = null,
+        pendingInstallAssetId = null,
+        pendingInstallAssetDigest = null,
         isUpdateAvailable = updateFlagAgainstSnapshot(versionCode, versionName ?: adoptedTag),
     )
 }
@@ -136,22 +159,139 @@ fun InstalledApp.tagForObservedBuild(
     return if (codeProvesSnapshot || nameProvesSnapshot) snapshotTag else installedVersion
 }
 
+sealed interface BindingStatus {
+    data object Intact : BindingStatus
+
+    data class Broken(val reason: BreakReason) : BindingStatus
+
+    enum class BreakReason {
+        PACKAGE_NAME,
+
+        VERSION_CODE,
+
+        VERSION_NAME,
+
+        SIGNING_FINGERPRINT,
+    }
+}
+
+/** What a scan of the device found relative to the record. */
+enum class DeviceChange {
+    /** Everything the record knows still matches: there is nothing to write. */
+    NONE,
+
+    DOWNGRADE,
+
+    /**
+     * Same version, different signer. The version fields cannot express this, and reporting it as
+     * an "update" names a version change that did not happen.
+     */
+    SIGNER_CHANGE,
+
+    VERSION_CHANGE,
+}
+
+/**
+ * Compares the record against the device.
+ *
+ * A drift is only claimed when *both* sides carry a key — a value we do not have cannot disagree,
+ * and guessing would turn every unknown into a false alarm.
+ *
+ * [SIGNER_CHANGE] is deliberately not [NONE]: a signer that differs from the recorded one has to
+ * keep the record out of the "nothing to do" branch, or nothing would ever write the device's key
+ * back and the same mismatch would be reported on every scan.
+ */
+fun InstalledApp.deviceChangeAgainst(local: SystemPackageInfo): DeviceChange {
+    val signerDrifted =
+        !local.signingFingerprint.isNullOrBlank() &&
+            !signingFingerprint.isNullOrBlank() &&
+            !local.signingFingerprint.equals(signingFingerprint, ignoreCase = true)
+    val versionMatches =
+        local.versionCode == installedVersionCode && local.versionName == installedVersionName
+    return when {
+        versionMatches && !signerDrifted -> DeviceChange.NONE
+        local.versionCode < installedVersionCode -> DeviceChange.DOWNGRADE
+        versionMatches -> DeviceChange.SIGNER_CHANGE
+        else -> DeviceChange.VERSION_CHANGE
+    }
+}
+
+fun InstalledApp.bindingStatusAgainst(local: SystemPackageInfo): BindingStatus {
+    if (local.packageName != packageName) {
+        return BindingStatus.Broken(BindingStatus.BreakReason.PACKAGE_NAME)
+    }
+
+    if (local.versionCode > 0L &&
+        installedVersionCode > 0L &&
+        local.versionCode != installedVersionCode
+    ) {
+        return BindingStatus.Broken(BindingStatus.BreakReason.VERSION_CODE)
+    }
+
+    if (local.versionName.isNotBlank() &&
+        !installedVersionName.isNullOrBlank() &&
+        local.versionName != installedVersionName
+    ) {
+        return BindingStatus.Broken(BindingStatus.BreakReason.VERSION_NAME)
+    }
+
+    // The one criterion the version fields cannot express: a different signer is a different build.
+    val localSign = local.signingFingerprint
+    if (!localSign.isNullOrBlank() &&
+        !signingFingerprint.isNullOrBlank() &&
+        !localSign.equals(signingFingerprint, ignoreCase = true)
+    ) {
+        return BindingStatus.Broken(BindingStatus.BreakReason.SIGNING_FINGERPRINT)
+    }
+
+    return BindingStatus.Intact
+}
+
+// Not our release, and which one it is is unknown.
 fun InstalledApp.observeExternalInstall(
     versionName: String?,
     versionCode: Long,
+    signingFingerprint: String? = null,
 ): InstalledApp {
     val adoptedTag = tagForObservedBuild(versionName, versionCode)
     return copy(
         installedVersion = adoptedTag,
         installedVersionName = versionName,
         installedVersionCode = versionCode,
+        signingFingerprint = signingFingerprint ?: this.signingFingerprint,
+        installedReleaseId = null,
+        installedAssetId = null,
+        installedAssetDigest = null,
         isUpdateAvailable = updateFlagAgainstSnapshot(versionCode, versionName ?: adoptedTag),
     )
 }
 
-fun InstalledApp.markPending(): InstalledApp = copy(isPendingInstall = true)
+/**
+ * Records the identity the install is aiming at, next to the parked file it will install from.
+ * The installed side is cleared: while a pending install is in flight the record must not claim a
+ * release the device is about to leave. [resolvePendingFromSystem] moves the identity across once
+ * the system proves the install reached that build.
+ */
+fun InstalledApp.markPending(
+    releaseId: Long?,
+    assetId: Long?,
+    assetDigest: String?,
+): InstalledApp = copy(
+    isPendingInstall = true,
+    installedReleaseId = null,
+    installedAssetId = null,
+    installedAssetDigest = null,
+    pendingInstallReleaseId = releaseId,
+    pendingInstallAssetId = assetId,
+    pendingInstallAssetDigest = assetDigest,
+)
 
-fun InstalledApp.clearPending(): InstalledApp = copy(isPendingInstall = false)
+fun InstalledApp.clearPending(): InstalledApp = copy(
+    isPendingInstall = false,
+    pendingInstallReleaseId = null,
+    pendingInstallAssetId = null,
+    pendingInstallAssetDigest = null,
+)
 
 fun InstalledApp.withLatestSnapshot(
     version: String,

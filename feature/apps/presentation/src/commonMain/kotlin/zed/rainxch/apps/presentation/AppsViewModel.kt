@@ -1280,7 +1280,11 @@ class AppsViewModel(
                     if (currentApp != null) {
                         installedAppsRepository.updateApp(
                             currentApp
-                                .markPending()
+                                .markPending(
+                                    releaseId = latestRelease.id,
+                                    assetId = primaryAsset.id,
+                                    assetDigest = primaryAsset.digest,
+                                )
                                 .withLatestSnapshot(
                                     version = latestVersion,
                                     assetName = latestAssetName,

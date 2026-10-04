@@ -375,13 +375,44 @@ class InstalledAppsRepositoryImpl(
                 installedAppsDao.setSkippedReleaseTag(packageName, null)
             }
 
-            val isUpdateAvailable = verdict.isUpdateAvailable
+            // A record that carries an identity is decided by the file first: the same bytes are
+            // up to date whatever the tags say, and a changed file only counts when the matched
+            // release is newer than the one this install came from. Without an identity there is
+            // nothing to compare against, so today's verdict stands unchanged.
+            val hasIdentity = app.installedAssetId != null || app.installedAssetDigest != null
+            val installedReleasePublishedAt =
+                if (app.installedReleaseId == null) {
+                    null
+                } else {
+                    releases.firstOrNull { it.id == app.installedReleaseId }?.publishedAt
+                }
+            val sameFile =
+                hasIdentity &&
+                    UpdateVerdict.isSameFile(
+                        installedAssetId = app.installedAssetId,
+                        installedAssetDigest = app.installedAssetDigest,
+                        matchedAssetId = primaryAsset.id,
+                        matchedAssetDigest = primaryAsset.digest,
+                    )
+
+            val isUpdateAvailable =
+                if (!hasIdentity) {
+                    verdict.isUpdateAvailable
+                } else {
+                    UpdateVerdict.decideBound(
+                        sameFile = sameFile,
+                        matchedPublishedAt = matchedRelease.publishedAt,
+                        installedReleasePublishedAt = installedReleasePublishedAt,
+                        fallback = verdict.isUpdateAvailable,
+                    )
+                }
 
             Logger.d {
                 "[UPDATE-CHECK] ${app.appName} $packageName " +
                         "installedTag=${app.installedVersion} matchedTag=${matchedRelease.tagName} " +
                         "storedPublishedAt=${app.latestReleasePublishedAt} " +
                         "matchedPublishedAt=${matchedRelease.publishedAt} " +
+                        "hasIdentity=$hasIdentity sameFile=$sameFile " +
                         "isUpdate=$isUpdateAvailable"
             }
 
@@ -460,8 +491,11 @@ class InstalledAppsRepositoryImpl(
     override suspend fun updateAppVersion(
         packageName: String,
         newTag: String,
-        newAssetName: String,
-        newAssetUrl: String,
+        newReleaseId: Long?,
+        newAssetId: Long?,
+        newAssetDigest: String?,
+        newAssetName: String?,
+        newAssetUrl: String?,
         newVersionName: String,
         newVersionCode: Long,
         signingFingerprint: String?,
@@ -491,6 +525,9 @@ class InstalledAppsRepositoryImpl(
             app.toDomain()
                 .confirmInstall(
                     tag = newTag,
+                    releaseId = newReleaseId,
+                    assetId = newAssetId,
+                    assetDigest = newAssetDigest,
                     assetName = newAssetName,
                     assetUrl = newAssetUrl,
                     versionName = newVersionName,
@@ -501,6 +538,10 @@ class InstalledAppsRepositoryImpl(
                 )
                 .toEntity(),
         )
+    }
+
+    override suspend fun clearInstallBinding(packageName: String) {
+        installedAppsDao.clearInstallBinding(packageName)
     }
 
     override suspend fun updateApp(app: InstalledApp) {
@@ -530,7 +571,19 @@ class InstalledAppsRepositoryImpl(
         val app = installedAppsDao.getAppByPackage(packageName) ?: return
         installedAppsDao.updateApp(
             app.toDomain()
-                .let { if (isPending) it.markPending() else it.clearPending() }
+                .let {
+                    if (isPending) {
+                        // Only the stored snapshot is available at this layer; callers that hold a
+                        // fresher release/asset pass the identity straight to markPending instead.
+                        it.markPending(
+                            releaseId = app.latestReleaseId,
+                            assetId = app.latestAssetId,
+                            assetDigest = app.latestAssetDigest,
+                        )
+                    } else {
+                        it.clearPending()
+                    }
+                }
                 .toEntity(),
         )
     }
